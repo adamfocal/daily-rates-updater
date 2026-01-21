@@ -1,0 +1,11 @@
+{
+  "name": "daily-rates-updater",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "run": "node run.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.50.0"
+  }
+}
