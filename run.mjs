@@ -3,9 +3,12 @@ import { chromium } from "playwright";
 const ENDPOINT = process.env.RATES_ENDPOINT;
 const TOKEN = process.env.RATES_API_TOKEN;
 
-if (!ENDPOINT || !TOKEN) throw new Error("Missing RATES_ENDPOINT or RATES_API_TOKEN");
+if (!ENDPOINT || !TOKEN) {
+  throw new Error("Missing RATES_ENDPOINT or RATES_API_TOKEN env vars");
+}
 
 function toNumber(s) {
+  // Handles "3.650%" → 3.65 and trims whitespace
   const cleaned = String(s).replace(/[%\s,]/g, "").trim();
   const n = Number(cleaned);
   if (Number.isNaN(n)) throw new Error(`Could not parse number from: ${s}`);
@@ -13,24 +16,20 @@ function toNumber(s) {
 }
 
 function normalizeTreasuryKey(label) {
+  // "1 Year" -> "1y"
   const m = label.match(/^(\d+)\s*Year$/i);
   if (m) return `${m[1]}y`;
   return null;
 }
 
-function todayISO() {
-  return new Date().toISOString().slice(0, 10);
-}
-
 async function scrapeCardTable(page, titleText) {
-  // Find the first table after a heading containing titleText
+  // First table after a heading containing titleText
   const table = page
     .locator(`xpath=//*[contains(normalize-space(.), "${titleText}")]/following::table[1]`)
     .first();
   await table.waitFor({ timeout: 120000 });
 
-  // Headers: we want the 3 date columns that correspond to the 3 value columns
-  // We assume first column header is "Term", then 3 date headers.
+  // Expect 4 headers: Term + 3 date columns
   const ths = table.locator("thead tr th");
   const thCount = await ths.count();
   if (thCount < 4) throw new Error(`Unexpected header count for ${titleText}: ${thCount}`);
@@ -63,17 +62,21 @@ async function scrapeCardTable(page, titleText) {
 const browser = await chromium.launch({ headless: true });
 const page = await browser.newPage({ viewport: { width: 1600, height: 900 } });
 
-await page.goto("https://www.chathamfinancial.com/rates", { waitUntil: "networkidle", timeout: 120000 });
+await page.goto("https://www.chathamfinancial.com/rates", {
+  waitUntil: "networkidle",
+  timeout: 120000,
+});
+
 await page.locator("text=U.S. Treasuries").first().waitFor({ timeout: 120000 });
 await page.locator("text=SOFR").first().waitFor({ timeout: 120000 });
 
-// Treasuries
+// --- Treasuries ---
 const treas = await scrapeCardTable(page, "U.S. Treasuries");
 const treasury = {};
 for (const r of treas.data) {
   const key = normalizeTreasuryKey(r.term);
   if (!key) continue;
-  if (["1y","2y","3y","5y","7y","10y","30y"].includes(key)) {
+  if (["1y", "2y", "3y", "5y", "7y", "10y", "30y"].includes(key)) {
     treasury[key] = {
       col1: toNumber(r.v1),
       col2: toNumber(r.v2),
@@ -82,13 +85,16 @@ for (const r of treas.data) {
   }
 }
 
-// SOFR
+// --- SOFR ---
 const sofrTable = await scrapeCardTable(page, "SOFR");
 const sofr = {};
 for (const r of sofrTable.data) {
   const label = r.term.toLowerCase();
-
-  const payload = { col1: toNumber(r.v1), col2: toNumber(r.v2), col3: toNumber(r.v3) };
+  const payload = {
+    col1: toNumber(r.v1),
+    col2: toNumber(r.v2),
+    col3: toNumber(r.v3),
+  };
 
   if (label === "sofr") sofr["sofr"] = payload;
   else if (label.includes("30-day") && label.includes("average")) sofr["30d-avg"] = payload;
@@ -99,7 +105,7 @@ for (const r of sofrTable.data) {
 
 await browser.close();
 
-// Prefer SOFR dates if present; otherwise treasuries
+// Use SOFR dates if present; otherwise Treasuries dates
 const dates = sofrTable?.dates || treas.dates;
 
 const body = { dates, treasury, sofr };
@@ -111,10 +117,14 @@ const res = await fetch(ENDPOINT, {
   headers: {
     Authorization: `Bearer ${TOKEN}`,
     "Content-Type": "application/json",
+    "x-debug-payload": "1", // <— enables echo in response (per Lovable)
   },
   body: JSON.stringify(body),
 });
 
 const text = await res.text();
-if (!res.ok) throw new Error(`POST failed ${res.status}: ${text}`);
+if (!res.ok) {
+  throw new Error(`POST failed ${res.status}: ${text}`);
+}
+
 console.log("Success:", text);
