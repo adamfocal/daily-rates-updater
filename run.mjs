@@ -18,10 +18,11 @@ if (!RATES_API_TOKEN) throw new Error("Missing env: RATES_API_TOKEN");
 if (!RATES_SOURCE_URL) throw new Error("Missing env: RATES_SOURCE_URL");
 
 const debug = !!DEBUG;
-
 function log(...args) {
   if (debug) console.log(...args);
 }
+
+const DATE_RE = /\b\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\b/g;
 
 function parsePercentToNumber(v) {
   if (v == null) return null;
@@ -37,23 +38,31 @@ function normalizeDateText(s) {
 }
 
 function firstDateLike(text) {
-  // matches "20 Jan 2026" etc
   const m = String(text || "").match(/\b\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\b/);
   return m ? normalizeDateText(m[0]) : null;
 }
 
+/**
+ * IMPORTANT: The previous bug was that the "card root" returned
+ * a parent container that included BOTH tables (Treasuries + SOFR).
+ * Then "Updated ..." could be taken from the wrong card.
+ *
+ * Fix: climb until we find an ancestor that contains EXACTLY ONE table.
+ */
 async function findCardRootByHeading(page, headingText) {
-  // Find the element containing the heading text, then climb to a parent that contains a table
   const heading = page.locator(`text=${headingText}`).first();
   await heading.waitFor({ state: "visible", timeout: 30000 });
 
   const cardHandle = await heading.evaluateHandle((el) => {
     let cur = el;
-    for (let i = 0; i < 16; i++) {
+    for (let i = 0; i < 24; i++) {
       if (!cur) break;
-      // "card-like" container that contains a table
-      const hasTable = !!cur.querySelector?.("table");
-      if (hasTable) return cur;
+
+      const tables = cur.querySelectorAll?.("table")?.length ?? 0;
+      if (tables === 1) {
+        return cur;
+      }
+
       cur = cur.parentElement;
     }
     return null;
@@ -71,63 +80,89 @@ async function findTableWithin(cardEl) {
   return table;
 }
 
-async function extractThreeHeaderDates(tableEl) {
-  // Pull THEAD th text first (most reliable for column order)
-  const headerDates = await tableEl.evaluate((table) => {
-    const ths = Array.from(table.querySelectorAll("thead th")).map((th) =>
-      (th.textContent || "").trim()
-    );
+/**
+ * Extract the 3 COLUMN HEADER DATES as displayed above the table.
+ *
+ * On Chatham, these dates are often NOT inside <thead>.
+ * The most robust method is:
+ * - find the <table>
+ * - walk the DOM within the card, collecting date-like text that appears BEFORE the table
+ * - take the first 3 unique dates in DOM order
+ */
+async function extractThreeHeaderDatesFromCard(cardEl) {
+  const dates = await cardEl.evaluate((card) => {
+    const DATE_RE = /\b\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\b/g;
 
-    const looksLikeDate = (t) => /\b\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\b/.test(t);
+    const table = card.querySelector("table");
+    if (!table) return [];
 
-    // Many tables: first th is "Term", next three are the dates
-    // Keep order as displayed.
-    const dateCandidates = ths.filter(looksLikeDate);
-    return dateCandidates.slice(0, 3);
-  });
-
-  if (headerDates && headerDates.length === 3) {
-    return {
-      col1: normalizeDateText(headerDates[0]),
-      col2: normalizeDateText(headerDates[1]),
-      col3: normalizeDateText(headerDates[2]),
+    // Helper: does node appear before table in DOM order?
+    const isBeforeTable = (node) => {
+      const pos = node.compareDocumentPosition(table);
+      // DOCUMENT_POSITION_FOLLOWING means node is before table
+      return !!(pos & Node.DOCUMENT_POSITION_FOLLOWING);
     };
-  }
 
-  // Fallback: scan only the table header area text (avoid footer "Updated ..." as much as possible)
-  const fallback = await tableEl.evaluate((table) => {
-    const head = table.querySelector("thead");
-    const text = (head ? head.textContent : table.textContent) || "";
-    const matches = text.match(/\b\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\b/g) || [];
-    const uniq = [];
-    for (const m of matches) {
-      const v = m.trim();
-      if (!uniq.includes(v)) uniq.push(v);
-      if (uniq.length === 3) break;
+    // Collect candidate text chunks before table
+    const chunks = [];
+    const walker = document.createTreeWalker(card, NodeFilter.SHOW_ELEMENT, null);
+    let n = walker.currentNode;
+
+    while (n) {
+      // stop traversing once we’ve reached the table element itself
+      if (n === table) break;
+
+      // only consider elements that are before the table
+      if (isBeforeTable(n)) {
+        const t = (n.textContent || "").replace(/\s+/g, " ").trim();
+        if (t && DATE_RE.test(t)) {
+          // reset regex state (because /g)
+          DATE_RE.lastIndex = 0;
+          chunks.push(t);
+        } else {
+          DATE_RE.lastIndex = 0;
+        }
+      }
+
+      n = walker.nextNode();
     }
-    return uniq;
+
+    // From those chunks, pull date matches in order, unique
+    const out = [];
+    for (const c of chunks) {
+      const matches = c.match(DATE_RE) || [];
+      for (const m of matches) {
+        const v = m.trim().replace(/\s+/g, " ");
+        if (!out.includes(v)) out.push(v);
+        if (out.length === 3) return out;
+      }
+    }
+
+    return out;
   });
 
-  if (fallback.length === 3) {
-    return {
-      col1: normalizeDateText(fallback[0]),
-      col2: normalizeDateText(fallback[1]),
-      col3: normalizeDateText(fallback[2]),
-    };
+  if (!dates || dates.length !== 3) {
+    throw new Error(`Could not extract 3 header dates from card. Got: ${JSON.stringify(dates)}`);
   }
 
-  throw new Error("Could not extract 3 header dates from table");
+  return {
+    col1: normalizeDateText(dates[0]),
+    col2: normalizeDateText(dates[1]),
+    col3: normalizeDateText(dates[2]),
+  };
 }
 
+/**
+ * Extract the "Updated ..." date from the card footer.
+ * We look specifically for the substring starting at "Updated"
+ * INSIDE THIS CARD (now that card scoping is correct).
+ */
 async function extractUpdatedDateFromCard(cardEl) {
-  // Card contains a footer like: "Updated 21 Jan 2026 | 18:45 ET"
-  // We grab the first date-like string in the entire card text that appears near "Updated".
   const updatedText = await cardEl.evaluate((card) => {
     const full = (card.textContent || "").replace(/\s+/g, " ").trim();
-    // Narrow to substring around "Updated" if present
     const idx = full.toLowerCase().lastIndexOf("updated");
-    if (idx >= 0) return full.slice(idx, Math.min(full.length, idx + 120));
-    return full; // fallback
+    if (idx >= 0) return full.slice(idx, Math.min(full.length, idx + 140));
+    return full;
   });
 
   const d = firstDateLike(updatedText);
@@ -172,7 +207,6 @@ async function extractRatesFromTreasuryTable(tableEl) {
     const c3 = parsePercentToNumber(r.col3);
 
     if (c1 == null || c2 == null || c3 == null) continue;
-
     treasury[key] = { col1: c1, col2: c2, col3: c3 };
   }
 
@@ -219,7 +253,6 @@ async function extractRatesFromSofrTable(tableEl) {
     const c3 = parsePercentToNumber(r.col3);
 
     if (c1 == null || c2 == null || c3 == null) continue;
-
     sofr[key] = { col1: c1, col2: c2, col3: c3 };
   }
 
@@ -231,6 +264,17 @@ async function extractRatesFromSofrTable(tableEl) {
   return sofr;
 }
 
+/**
+ * Optional: sanity checks so we fail loudly if Chatham DOM changes.
+ */
+function assert3UniqueDates(label, d) {
+  const arr = [d.col1, d.col2, d.col3].map(normalizeDateText);
+  const uniq = new Set(arr);
+  if (uniq.size !== 3) {
+    throw new Error(`${label} header dates are not 3 unique values: ${JSON.stringify(arr)}`);
+  }
+}
+
 async function main() {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
@@ -239,36 +283,30 @@ async function main() {
 
   log("Navigating to:", RATES_SOURCE_URL);
   await page.goto(RATES_SOURCE_URL, { waitUntil: "networkidle", timeout: 60000 });
-
-  // Some pages lazy-load; give it a beat
   await page.waitForTimeout(1500);
 
-  // Find each card root and its table
   const treasuryCard = await findCardRootByHeading(page, "U.S. Treasuries");
   const sofrCard = await findCardRootByHeading(page, "Secured Overnight Financing Rate (SOFR)");
 
   const treasuryTable = await findTableWithin(treasuryCard);
   const sofrTable = await findTableWithin(sofrCard);
 
-  // 3 column header dates (these should power your UI column headers)
-  const treasury_dates = await extractThreeHeaderDates(treasuryTable);
-  const sofr_dates = await extractThreeHeaderDates(sofrTable);
+  // Column header dates for UI (these must align with the visible columns)
+  const treasury_dates = await extractThreeHeaderDatesFromCard(treasuryCard);
+  const sofr_dates = await extractThreeHeaderDatesFromCard(sofrCard);
 
-  // "Updated ..." dates (metadata; your edge function currently requires these)
+  assert3UniqueDates("Treasury", treasury_dates);
+  assert3UniqueDates("SOFR", sofr_dates);
+
+  // "Updated ..." dates (required by your edge function contract)
   const treasuryUpdated = await extractUpdatedDateFromCard(treasuryCard);
   const sofrUpdated = await extractUpdatedDateFromCard(sofrCard);
 
   const treasury = await extractRatesFromTreasuryTable(treasuryTable);
   const sofr = await extractRatesFromSofrTable(sofrTable);
 
-  // Payload includes BOTH:
-  // - dates: required by edge function (Updated dates)
-  // - treasury_dates/sofr_dates: needed for UI column headers
   const payload = {
-    dates: {
-      treasury: treasuryUpdated,
-      sofr: sofrUpdated,
-    },
+    dates: { treasury: treasuryUpdated, sofr: sofrUpdated },
     treasury_dates,
     sofr_dates,
     treasury,
@@ -287,9 +325,7 @@ async function main() {
   });
 
   const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`Edge function error ${res.status}: ${text}`);
-  }
+  if (!res.ok) throw new Error(`Edge function error ${res.status}: ${text}`);
 
   console.log("Success:", text);
   await browser.close();
