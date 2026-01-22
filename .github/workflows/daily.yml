@@ -2,34 +2,30 @@ name: Daily Rates Update
 
 on:
   schedule:
-    - cron: "30 23 * * *"
-  workflow_dispatch: {}
+    - cron: "0 12 * * 1-5"   # runs weekdays
+  workflow_dispatch:
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
 
     env:
-      RATES_SOURCE_URL: ${{ vars.RATES_SOURCE_URL }}
-      RATES_ENDPOINT: ${{ secrets.RATES_ENDPOINT }}
-      RATES_API_TOKEN: ${{ secrets.RATES_API_TOKEN }}
+      RATES_SOURCE_URL: ${{ secrets.RATES_SOURCE_URL }}
+      RATES_ENDPOINT:   ${{ secrets.RATES_ENDPOINT }}
+      RATES_API_TOKEN:  ${{ secrets.RATES_API_TOKEN }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: 20
 
       - name: Install deps
         run: npm install
 
-      # ✅ This is the missing piece
-      - name: Install Playwright browsers (Chromium)
-        run: npx playwright install --with-deps chromium
+      - name: Install Playwright browsers
+        run: npx playwright install chromium
 
       - name: Run updater
-        run: npm run run
+        run: node run.mjs
