@@ -11,12 +11,7 @@ import { chromium } from "playwright";
  * - DEBUG=1
  */
 
-const {
-  RATES_ENDPOINT,
-  RATES_API_TOKEN,
-  RATES_SOURCE_URL,
-  DEBUG,
-} = process.env;
+const { RATES_ENDPOINT, RATES_API_TOKEN, RATES_SOURCE_URL, DEBUG } = process.env;
 
 if (!RATES_ENDPOINT) throw new Error("Missing env: RATES_ENDPOINT");
 if (!RATES_API_TOKEN) throw new Error("Missing env: RATES_API_TOKEN");
@@ -29,7 +24,6 @@ function log(...args) {
 }
 
 function parsePercentToNumber(v) {
-  // accepts "3.528%", "3.65000%", "4.07237%", "3.53" etc
   if (v == null) return null;
   const s = String(v).trim();
   const cleaned = s.replace(/[%\s]/g, "").replace(/,/g, "");
@@ -38,40 +32,56 @@ function parsePercentToNumber(v) {
 }
 
 function normalizeDateText(s) {
-  // Keep the same display style you already use: "16 Jan 2026"
   if (!s) return null;
-  return String(s).trim();
+  return String(s).trim().replace(/\s+/g, " ");
 }
 
-async function findCardTableByHeading(page, headingText) {
+function firstDateLike(text) {
+  // matches "20 Jan 2026" etc
+  const m = String(text || "").match(/\b\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\b/);
+  return m ? normalizeDateText(m[0]) : null;
+}
+
+async function findCardRootByHeading(page, headingText) {
+  // Find the element containing the heading text, then climb to a parent that contains a table
   const heading = page.locator(`text=${headingText}`).first();
   await heading.waitFor({ state: "visible", timeout: 30000 });
 
-  const tableHandle = await heading.evaluateHandle((el) => {
+  const cardHandle = await heading.evaluateHandle((el) => {
     let cur = el;
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 16; i++) {
       if (!cur) break;
-      const t = cur.querySelector?.("table");
-      if (t) return t;
+      // "card-like" container that contains a table
+      const hasTable = !!cur.querySelector?.("table");
+      if (hasTable) return cur;
       cur = cur.parentElement;
     }
     return null;
   });
 
+  const card = cardHandle.asElement();
+  if (!card) throw new Error(`Could not find card root for heading: ${headingText}`);
+  return card;
+}
+
+async function findTableWithin(cardEl) {
+  const tableHandle = await cardEl.evaluateHandle((card) => card.querySelector("table") || null);
   const table = tableHandle.asElement();
-  if (!table) throw new Error(`Could not find table for heading: ${headingText}`);
+  if (!table) throw new Error("Could not find table inside card");
   return table;
 }
 
-async function extractThreeDatesFromTable(tableEl) {
+async function extractThreeHeaderDates(tableEl) {
+  // Pull THEAD th text first (most reliable for column order)
   const headerDates = await tableEl.evaluate((table) => {
     const ths = Array.from(table.querySelectorAll("thead th")).map((th) =>
       (th.textContent || "").trim()
     );
 
-    const looksLikeDate = (t) =>
-      /\b\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\b/.test(t);
+    const looksLikeDate = (t) => /\b\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\b/.test(t);
 
+    // Many tables: first th is "Term", next three are the dates
+    // Keep order as displayed.
     const dateCandidates = ths.filter(looksLikeDate);
     return dateCandidates.slice(0, 3);
   });
@@ -84,30 +94,48 @@ async function extractThreeDatesFromTable(tableEl) {
     };
   }
 
-  const fallbackDates = await tableEl.evaluate((table) => {
-    const text = (table.textContent || "").trim();
+  // Fallback: scan only the table header area text (avoid footer "Updated ..." as much as possible)
+  const fallback = await tableEl.evaluate((table) => {
+    const head = table.querySelector("thead");
+    const text = (head ? head.textContent : table.textContent) || "";
     const matches = text.match(/\b\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\b/g) || [];
     const uniq = [];
     for (const m of matches) {
-      if (!uniq.includes(m)) uniq.push(m);
+      const v = m.trim();
+      if (!uniq.includes(v)) uniq.push(v);
       if (uniq.length === 3) break;
     }
     return uniq;
   });
 
-  if (fallbackDates.length === 3) {
+  if (fallback.length === 3) {
     return {
-      col1: normalizeDateText(fallbackDates[0]),
-      col2: normalizeDateText(fallbackDates[1]),
-      col3: normalizeDateText(fallbackDates[2]),
+      col1: normalizeDateText(fallback[0]),
+      col2: normalizeDateText(fallback[1]),
+      col3: normalizeDateText(fallback[2]),
     };
   }
 
-  throw new Error("Could not extract 3 dates from table");
+  throw new Error("Could not extract 3 header dates from table");
 }
 
-async function extractLatestRatesFromTreasuryTable(tableEl) {
-  // Map row label -> term_key
+async function extractUpdatedDateFromCard(cardEl) {
+  // Card contains a footer like: "Updated 21 Jan 2026 | 18:45 ET"
+  // We grab the first date-like string in the entire card text that appears near "Updated".
+  const updatedText = await cardEl.evaluate((card) => {
+    const full = (card.textContent || "").replace(/\s+/g, " ").trim();
+    // Narrow to substring around "Updated" if present
+    const idx = full.toLowerCase().lastIndexOf("updated");
+    if (idx >= 0) return full.slice(idx, Math.min(full.length, idx + 120));
+    return full; // fallback
+  });
+
+  const d = firstDateLike(updatedText);
+  if (!d) throw new Error(`Could not find Updated date in card text: ${updatedText}`);
+  return d;
+}
+
+async function extractRatesFromTreasuryTable(tableEl) {
   const mapKey = (label) => {
     const t = label.toLowerCase().replace(/\s+/g, "");
     if (t.startsWith("1year")) return "1y";
@@ -127,12 +155,8 @@ async function extractLatestRatesFromTreasuryTable(tableEl) {
       const tds = Array.from(tr.querySelectorAll("td")).map((td) =>
         (td.textContent || "").trim()
       );
-      // Expected: [TermLabel, col1, col2, col3]
       if (tds.length >= 4) {
-        out.push({
-          termLabel: tds[0],
-          col1: tds[1], // latest
-        });
+        out.push({ termLabel: tds[0], col1: tds[1], col2: tds[2], col3: tds[3] });
       }
     }
     return out;
@@ -143,21 +167,24 @@ async function extractLatestRatesFromTreasuryTable(tableEl) {
     const key = mapKey(r.termLabel);
     if (!key) continue;
 
-    const latest = parsePercentToNumber(r.col1);
-    if (latest == null) continue;
+    const c1 = parsePercentToNumber(r.col1);
+    const c2 = parsePercentToNumber(r.col2);
+    const c3 = parsePercentToNumber(r.col3);
 
-    treasury[key] = latest;
+    if (c1 == null || c2 == null || c3 == null) continue;
+
+    treasury[key] = { col1: c1, col2: c2, col3: c3 };
   }
 
   const required = ["1y", "2y", "3y", "5y", "7y", "10y", "30y"];
   for (const k of required) {
-    if (treasury[k] == null) throw new Error(`Missing treasury row for term_key: ${k}`);
+    if (!treasury[k]) throw new Error(`Missing treasury row for term_key: ${k}`);
   }
 
   return treasury;
 }
 
-async function extractLatestRatesFromSofrTable(tableEl) {
+async function extractRatesFromSofrTable(tableEl) {
   const mapKey = (label) => {
     const t = label.toLowerCase().trim();
     if (t === "sofr") return "sofr";
@@ -175,12 +202,8 @@ async function extractLatestRatesFromSofrTable(tableEl) {
       const tds = Array.from(tr.querySelectorAll("td")).map((td) =>
         (td.textContent || "").trim()
       );
-      // Expected: [TermLabel, col1, col2, col3]
       if (tds.length >= 4) {
-        out.push({
-          termLabel: tds[0],
-          col1: tds[1], // latest
-        });
+        out.push({ termLabel: tds[0], col1: tds[1], col2: tds[2], col3: tds[3] });
       }
     }
     return out;
@@ -191,15 +214,18 @@ async function extractLatestRatesFromSofrTable(tableEl) {
     const key = mapKey(r.termLabel);
     if (!key) continue;
 
-    const latest = parsePercentToNumber(r.col1);
-    if (latest == null) continue;
+    const c1 = parsePercentToNumber(r.col1);
+    const c2 = parsePercentToNumber(r.col2);
+    const c3 = parsePercentToNumber(r.col3);
 
-    sofr[key] = latest;
+    if (c1 == null || c2 == null || c3 == null) continue;
+
+    sofr[key] = { col1: c1, col2: c2, col3: c3 };
   }
 
   const required = ["sofr", "30d-avg", "90d-avg", "1m-term", "3m-term"];
   for (const k of required) {
-    if (sofr[k] == null) throw new Error(`Missing SOFR row for term_key: ${k}`);
+    if (!sofr[k]) throw new Error(`Missing SOFR row for term_key: ${k}`);
   }
 
   return sofr;
@@ -213,33 +239,41 @@ async function main() {
 
   log("Navigating to:", RATES_SOURCE_URL);
   await page.goto(RATES_SOURCE_URL, { waitUntil: "networkidle", timeout: 60000 });
+
+  // Some pages lazy-load; give it a beat
   await page.waitForTimeout(1500);
 
-  const treasuryTable = await findCardTableByHeading(page, "U.S. Treasuries");
-  const sofrTable = await findCardTableByHeading(page, "Secured Overnight Financing Rate (SOFR)");
+  // Find each card root and its table
+  const treasuryCard = await findCardRootByHeading(page, "U.S. Treasuries");
+  const sofrCard = await findCardRootByHeading(page, "Secured Overnight Financing Rate (SOFR)");
 
-  // Pull the 3 dates, then use the LATEST (col1) as the headline date for each table
-  const treasury_dates = await extractThreeDatesFromTable(treasuryTable);
-  const sofr_dates = await extractThreeDatesFromTable(sofrTable);
+  const treasuryTable = await findTableWithin(treasuryCard);
+  const sofrTable = await findTableWithin(sofrCard);
 
-  const treasury = await extractLatestRatesFromTreasuryTable(treasuryTable);
-  const sofr = await extractLatestRatesFromSofrTable(sofrTable);
+  // 3 column header dates (these should power your UI column headers)
+  const treasury_dates = await extractThreeHeaderDates(treasuryTable);
+  const sofr_dates = await extractThreeHeaderDates(sofrTable);
 
-  // NEW CONTRACT: dates object with separate treasury + sofr dates (strings)
+  // "Updated ..." dates (metadata; your edge function currently requires these)
+  const treasuryUpdated = await extractUpdatedDateFromCard(treasuryCard);
+  const sofrUpdated = await extractUpdatedDateFromCard(sofrCard);
+
+  const treasury = await extractRatesFromTreasuryTable(treasuryTable);
+  const sofr = await extractRatesFromSofrTable(sofrTable);
+
+  // Payload includes BOTH:
+  // - dates: required by edge function (Updated dates)
+  // - treasury_dates/sofr_dates: needed for UI column headers
   const payload = {
     dates: {
-      treasury: treasury_dates.col1,
-      sofr: sofr_dates.col1,
+      treasury: treasuryUpdated,
+      sofr: sofrUpdated,
     },
+    treasury_dates,
+    sofr_dates,
     treasury,
     sofr,
   };
-
-  if (!payload.dates.treasury || !payload.dates.sofr) {
-    throw new Error(
-      `Could not parse table dates. treasury="${payload.dates.treasury}" sofr="${payload.dates.sofr}"`
-    );
-  }
 
   console.log("Posting:", JSON.stringify(payload, null, 2));
 
@@ -258,7 +292,6 @@ async function main() {
   }
 
   console.log("Success:", text);
-
   await browser.close();
 }
 
