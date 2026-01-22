@@ -38,7 +38,7 @@ function parsePercentToNumber(v) {
 }
 
 function normalizeDateText(s) {
-  // Keep the same display style you already use: "16 Jan 2026"
+  // Keep display style like "16 Jan 2026"
   if (!s) return null;
   return String(s).trim();
 }
@@ -49,7 +49,7 @@ async function findCardTableByHeading(page, headingText) {
 
   const tableHandle = await heading.evaluateHandle((el) => {
     let cur = el;
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 14; i++) {
       if (!cur) break;
       const t = cur.querySelector?.("table");
       if (t) return t;
@@ -131,13 +131,16 @@ async function extractLatestRatesFromTreasuryTable(tableEl) {
       if (tds.length >= 4) {
         out.push({
           termLabel: tds[0],
-          col1: tds[1], // latest
+          col1: tds[1],
+          col2: tds[2],
+          col3: tds[3],
         });
       }
     }
     return out;
   });
 
+  // NEW CONTRACT: only send latest (col1) numbers
   const treasury = {};
   for (const r of rows) {
     const key = mapKey(r.termLabel);
@@ -151,7 +154,7 @@ async function extractLatestRatesFromTreasuryTable(tableEl) {
 
   const required = ["1y", "2y", "3y", "5y", "7y", "10y", "30y"];
   for (const k of required) {
-    if (treasury[k] == null) throw new Error(`Missing treasury row for term_key: ${k}`);
+    if (treasury[k] == null) throw new Error(`Missing treasury term: ${k}`);
   }
 
   return treasury;
@@ -179,13 +182,16 @@ async function extractLatestRatesFromSofrTable(tableEl) {
       if (tds.length >= 4) {
         out.push({
           termLabel: tds[0],
-          col1: tds[1], // latest
+          col1: tds[1],
+          col2: tds[2],
+          col3: tds[3],
         });
       }
     }
     return out;
   });
 
+  // NEW CONTRACT: only send latest (col1) numbers
   const sofr = {};
   for (const r of rows) {
     const key = mapKey(r.termLabel);
@@ -199,7 +205,7 @@ async function extractLatestRatesFromSofrTable(tableEl) {
 
   const required = ["sofr", "30d-avg", "90d-avg", "1m-term", "3m-term"];
   for (const k of required) {
-    if (sofr[k] == null) throw new Error(`Missing SOFR row for term_key: ${k}`);
+    if (sofr[k] == null) throw new Error(`Missing SOFR term: ${k}`);
   }
 
   return sofr;
@@ -213,33 +219,29 @@ async function main() {
 
   log("Navigating to:", RATES_SOURCE_URL);
   await page.goto(RATES_SOURCE_URL, { waitUntil: "networkidle", timeout: 60000 });
+
+  // Lazy-load buffer
   await page.waitForTimeout(1500);
 
   const treasuryTable = await findCardTableByHeading(page, "U.S. Treasuries");
-  const sofrTable = await findCardTableByHeading(page, "Secured Overnight Financing Rate (SOFR)");
+  const sofrTable = await findCardTableByHeading(
+    page,
+    "Secured Overnight Financing Rate (SOFR)"
+  );
 
-  // Pull the 3 dates, then use the LATEST (col1) as the headline date for each table
-  const treasury_dates = await extractThreeDatesFromTable(treasuryTable);
-  const sofr_dates = await extractThreeDatesFromTable(sofrTable);
+  const treasuryDates3 = await extractThreeDatesFromTable(treasuryTable);
+  const sofrDates3 = await extractThreeDatesFromTable(sofrTable);
+
+  // NEW CONTRACT: "dates" object with one string each (use latest/col1)
+  const dates = {
+    treasury: treasuryDates3.col1,
+    sofr: sofrDates3.col1,
+  };
 
   const treasury = await extractLatestRatesFromTreasuryTable(treasuryTable);
   const sofr = await extractLatestRatesFromSofrTable(sofrTable);
 
-  // NEW CONTRACT: dates object with separate treasury + sofr dates (strings)
-  const payload = {
-    dates: {
-      treasury: treasury_dates.col1,
-      sofr: sofr_dates.col1,
-    },
-    treasury,
-    sofr,
-  };
-
-  if (!payload.dates.treasury || !payload.dates.sofr) {
-    throw new Error(
-      `Could not parse table dates. treasury="${payload.dates.treasury}" sofr="${payload.dates.sofr}"`
-    );
-  }
+  const payload = { dates, treasury, sofr };
 
   console.log("Posting:", JSON.stringify(payload, null, 2));
 
