@@ -2,7 +2,6 @@ name: Daily Rates Update
 
 on:
   schedule:
-    # Runs daily at 23:30 UTC (adjust if you want)
     - cron: "30 23 * * *"
   workflow_dispatch: {}
 
@@ -12,10 +11,7 @@ jobs:
     timeout-minutes: 15
 
     env:
-      # Repo Variables
       RATES_SOURCE_URL: ${{ vars.RATES_SOURCE_URL }}
-
-      # Repo Secrets
       RATES_ENDPOINT: ${{ secrets.RATES_ENDPOINT }}
       RATES_API_TOKEN: ${{ secrets.RATES_API_TOKEN }}
 
@@ -28,8 +24,12 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install deps + Chromium
+      - name: Install deps
         run: npm install
+
+      # ✅ This is the missing piece
+      - name: Install Playwright browsers (Chromium)
+        run: npx playwright install --with-deps chromium
 
       - name: Run updater
         run: npm run run
