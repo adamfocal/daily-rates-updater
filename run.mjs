@@ -1,130 +1,280 @@
+// run.mjs
 import { chromium } from "playwright";
 
-const ENDPOINT = process.env.RATES_ENDPOINT;
-const TOKEN = process.env.RATES_API_TOKEN;
+/**
+ * ENV required in GitHub Actions:
+ * - RATES_ENDPOINT      (your Supabase edge function endpoint)
+ * - RATES_API_TOKEN     (Bearer token)
+ * - RATES_SOURCE_URL    (the web page that shows BOTH tables)
+ *
+ * Optional:
+ * - DEBUG=1
+ */
 
-if (!ENDPOINT || !TOKEN) {
-  throw new Error("Missing RATES_ENDPOINT or RATES_API_TOKEN env vars");
+const {
+  RATES_ENDPOINT,
+  RATES_API_TOKEN,
+  RATES_SOURCE_URL,
+  DEBUG,
+} = process.env;
+
+if (!RATES_ENDPOINT) throw new Error("Missing env: RATES_ENDPOINT");
+if (!RATES_API_TOKEN) throw new Error("Missing env: RATES_API_TOKEN");
+if (!RATES_SOURCE_URL) throw new Error("Missing env: RATES_SOURCE_URL");
+
+const debug = !!DEBUG;
+
+function log(...args) {
+  if (debug) console.log(...args);
 }
 
-function toNumber(s) {
-  // Handles "3.650%" → 3.65 and trims whitespace
-  const cleaned = String(s).replace(/[%\s,]/g, "").trim();
-  const n = Number(cleaned);
-  if (Number.isNaN(n)) throw new Error(`Could not parse number from: ${s}`);
-  return n;
+function parsePercentToNumber(v) {
+  // accepts "3.528%", "3.65000%", "4.07237%", "3.53" etc
+  if (v == null) return null;
+  const s = String(v).trim();
+  const cleaned = s.replace(/[%\s]/g, "").replace(/,/g, "");
+  const num = Number(cleaned);
+  return Number.isFinite(num) ? num : null;
 }
 
-function normalizeTreasuryKey(label) {
-  // "1 Year" -> "1y"
-  const m = label.match(/^(\d+)\s*Year$/i);
-  if (m) return `${m[1]}y`;
-  return null;
+function normalizeDateText(s) {
+  // Keep the same display style you already use: "16 Jan 2026"
+  // Incoming examples: "16 Jan 2026", "Updated 21 Jan 2026 | 18:45 ET"
+  if (!s) return null;
+  return String(s).trim();
 }
 
-async function scrapeCardTable(page, titleText) {
-  // First table after a heading containing titleText
-  const table = page
-    .locator(`xpath=//*[contains(normalize-space(.), "${titleText}")]/following::table[1]`)
-    .first();
-  await table.waitFor({ timeout: 120000 });
+async function findCardTableByHeading(page, headingText) {
+  // Find the element containing the heading text, then climb to a parent that contains a table
+  const heading = page.locator(`text=${headingText}`).first();
+  await heading.waitFor({ state: "visible", timeout: 30000 });
 
-  // Expect 4 headers: Term + 3 date columns
-  const ths = table.locator("thead tr th");
-  const thCount = await ths.count();
-  if (thCount < 4) throw new Error(`Unexpected header count for ${titleText}: ${thCount}`);
+  // Evaluate in browser context to find nearest ancestor that contains a table
+  const tableHandle = await heading.evaluateHandle((el) => {
+    let cur = el;
+    for (let i = 0; i < 12; i++) {
+      if (!cur) break;
+      const t = cur.querySelector?.("table");
+      if (t) return t;
+      cur = cur.parentElement;
+    }
+    return null;
+  });
 
-  const date1 = (await ths.nth(1).innerText()).trim();
-  const date2 = (await ths.nth(2).innerText()).trim();
-  const date3 = (await ths.nth(3).innerText()).trim();
-
-  const rows = table.locator("tbody tr");
-  const rowCount = await rows.count();
-  if (!rowCount) throw new Error(`No rows for ${titleText}`);
-
-  const data = [];
-  for (let i = 0; i < rowCount; i++) {
-    const tds = rows.nth(i).locator("td");
-    const c = await tds.count();
-    if (c < 4) continue;
-
-    const term = (await tds.nth(0).innerText()).trim();
-    const v1 = (await tds.nth(1).innerText()).trim();
-    const v2 = (await tds.nth(2).innerText()).trim();
-    const v3 = (await tds.nth(3).innerText()).trim();
-
-    data.push({ term, v1, v2, v3 });
-  }
-
-  return { dates: { col1: date1, col2: date2, col3: date3 }, data };
+  const table = tableHandle.asElement();
+  if (!table) throw new Error(`Could not find table for heading: ${headingText}`);
+  return table;
 }
 
-const browser = await chromium.launch({ headless: true });
-const page = await browser.newPage({ viewport: { width: 1600, height: 900 } });
+async function extractThreeDatesFromTable(tableEl) {
+  // Try header THs first
+  const headerDates = await tableEl.evaluate((table) => {
+    const ths = Array.from(table.querySelectorAll("thead th")).map((th) =>
+      (th.textContent || "").trim()
+    );
 
-await page.goto("https://www.chathamfinancial.com/rates", {
-  waitUntil: "networkidle",
-  timeout: 120000,
-});
+    // Many tables have a first "Term" header then 3 date headers
+    // We'll pick the first 3 that look like "16 Jan 2026"
+    const looksLikeDate = (t) =>
+      /\b\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\b/.test(t);
 
-await page.locator("text=U.S. Treasuries").first().waitFor({ timeout: 120000 });
-await page.locator("text=SOFR").first().waitFor({ timeout: 120000 });
+    const dateCandidates = ths.filter(looksLikeDate);
 
-// --- Treasuries ---
-const treas = await scrapeCardTable(page, "U.S. Treasuries");
-const treasury = {};
-for (const r of treas.data) {
-  const key = normalizeTreasuryKey(r.term);
-  if (!key) continue;
-  if (["1y", "2y", "3y", "5y", "7y", "10y", "30y"].includes(key)) {
-    treasury[key] = {
-      col1: toNumber(r.v1),
-      col2: toNumber(r.v2),
-      col3: toNumber(r.v3),
+    // If that fails, maybe the dates are in a separate header row
+    return dateCandidates.slice(0, 3);
+  });
+
+  if (headerDates && headerDates.length === 3) {
+    return {
+      col1: normalizeDateText(headerDates[0]),
+      col2: normalizeDateText(headerDates[1]),
+      col3: normalizeDateText(headerDates[2]),
     };
   }
+
+  // Fallback: scan entire table for date-looking strings and take the first 3 unique
+  const fallbackDates = await tableEl.evaluate((table) => {
+    const text = (table.textContent || "").trim();
+    const matches = text.match(/\b\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\b/g) || [];
+    const uniq = [];
+    for (const m of matches) {
+      if (!uniq.includes(m)) uniq.push(m);
+      if (uniq.length === 3) break;
+    }
+    return uniq;
+  });
+
+  if (fallbackDates.length === 3) {
+    return {
+      col1: normalizeDateText(fallbackDates[0]),
+      col2: normalizeDateText(fallbackDates[1]),
+      col3: normalizeDateText(fallbackDates[2]),
+    };
+  }
+
+  throw new Error("Could not extract 3 dates from table");
 }
 
-// --- SOFR ---
-const sofrTable = await scrapeCardTable(page, "SOFR");
-const sofr = {};
-for (const r of sofrTable.data) {
-  const label = r.term.toLowerCase();
-  const payload = {
-    col1: toNumber(r.v1),
-    col2: toNumber(r.v2),
-    col3: toNumber(r.v3),
+async function extractRatesFromTreasuryTable(tableEl) {
+  // Map row label -> term_key
+  const mapKey = (label) => {
+    const t = label.toLowerCase().replace(/\s+/g, "");
+    if (t.startsWith("1year")) return "1y";
+    if (t.startsWith("2year")) return "2y";
+    if (t.startsWith("3year")) return "3y";
+    if (t.startsWith("5year")) return "5y";
+    if (t.startsWith("7year")) return "7y";
+    if (t.startsWith("10year")) return "10y";
+    if (t.startsWith("30year")) return "30y";
+    return null;
   };
 
-  if (label === "sofr") sofr["sofr"] = payload;
-  else if (label.includes("30-day") && label.includes("average")) sofr["30d-avg"] = payload;
-  else if (label.includes("90-day") && label.includes("average")) sofr["90d-avg"] = payload;
-  else if (label.includes("1-month") && label.includes("term")) sofr["1m-term"] = payload;
-  else if (label.includes("3-month") && label.includes("term")) sofr["3m-term"] = payload;
+  const rows = await tableEl.evaluate((table) => {
+    const out = [];
+    const trs = Array.from(table.querySelectorAll("tbody tr"));
+    for (const tr of trs) {
+      const tds = Array.from(tr.querySelectorAll("td")).map((td) =>
+        (td.textContent || "").trim()
+      );
+      // Expected: [TermLabel, col1, col2, col3]
+      if (tds.length >= 4) {
+        out.push({
+          termLabel: tds[0],
+          col1: tds[1],
+          col2: tds[2],
+          col3: tds[3],
+        });
+      }
+    }
+    return out;
+  });
+
+  const treasury = {};
+  for (const r of rows) {
+    const key = mapKey(r.termLabel);
+    if (!key) continue;
+
+    const c1 = parsePercentToNumber(r.col1);
+    const c2 = parsePercentToNumber(r.col2);
+    const c3 = parsePercentToNumber(r.col3);
+
+    if (c1 == null || c2 == null || c3 == null) continue;
+
+    treasury[key] = { col1: c1, col2: c2, col3: c3 };
+  }
+
+  const required = ["1y", "2y", "3y", "5y", "7y", "10y", "30y"];
+  for (const k of required) {
+    if (!treasury[k]) throw new Error(`Missing treasury row for term_key: ${k}`);
+  }
+
+  return treasury;
 }
 
-await browser.close();
+async function extractRatesFromSofrTable(tableEl) {
+  const mapKey = (label) => {
+    const t = label.toLowerCase().trim();
+    if (t === "sofr") return "sofr";
+    if (t.includes("30-day") && t.includes("average")) return "30d-avg";
+    if (t.includes("90-day") && t.includes("average")) return "90d-avg";
+    if (t.includes("1-month") && t.includes("term")) return "1m-term";
+    if (t.includes("3-month") && t.includes("term")) return "3m-term";
+    return null;
+  };
 
-// Use SOFR dates if present; otherwise Treasuries dates
-const dates = sofrTable?.dates || treas.dates;
+  const rows = await tableEl.evaluate((table) => {
+    const out = [];
+    const trs = Array.from(table.querySelectorAll("tbody tr"));
+    for (const tr of trs) {
+      const tds = Array.from(tr.querySelectorAll("td")).map((td) =>
+        (td.textContent || "").trim()
+      );
+      // Expected: [TermLabel, col1, col2, col3]
+      if (tds.length >= 4) {
+        out.push({
+          termLabel: tds[0],
+          col1: tds[1],
+          col2: tds[2],
+          col3: tds[3],
+        });
+      }
+    }
+    return out;
+  });
 
-const body = { dates, treasury, sofr };
+  const sofr = {};
+  for (const r of rows) {
+    const key = mapKey(r.termLabel);
+    if (!key) continue;
 
-console.log("Posting:", JSON.stringify(body, null, 2));
+    const c1 = parsePercentToNumber(r.col1);
+    const c2 = parsePercentToNumber(r.col2);
+    const c3 = parsePercentToNumber(r.col3);
 
-const res = await fetch(ENDPOINT, {
-  method: "POST",
-  headers: {
-    Authorization: `Bearer ${TOKEN}`,
-    "Content-Type": "application/json",
-    "x-debug-payload": "1", // <— enables echo in response (per Lovable)
-  },
-  body: JSON.stringify(body),
+    if (c1 == null || c2 == null || c3 == null) continue;
+
+    sofr[key] = { col1: c1, col2: c2, col3: c3 };
+  }
+
+  const required = ["sofr", "30d-avg", "90d-avg", "1m-term", "3m-term"];
+  for (const k of required) {
+    if (!sofr[k]) throw new Error(`Missing SOFR row for term_key: ${k}`);
+  }
+
+  return sofr;
+}
+
+async function main() {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+
+  // Reduce bot issues / flaky loads
+  await page.setViewportSize({ width: 1400, height: 900 });
+
+  log("Navigating to:", RATES_SOURCE_URL);
+  await page.goto(RATES_SOURCE_URL, { waitUntil: "networkidle", timeout: 60000 });
+
+  // Some pages lazy-load; give it a beat
+  await page.waitForTimeout(1500);
+
+  const treasuryTable = await findCardTableByHeading(page, "U.S. Treasuries");
+  const sofrTable = await findCardTableByHeading(page, "Secured Overnight Financing Rate (SOFR)");
+
+  const treasury_dates = await extractThreeDatesFromTable(treasuryTable);
+  const sofr_dates = await extractThreeDatesFromTable(sofrTable);
+
+  const treasury = await extractRatesFromTreasuryTable(treasuryTable);
+  const sofr = await extractRatesFromSofrTable(sofrTable);
+
+  const payload = {
+    treasury_dates,
+    sofr_dates,
+    treasury,
+    sofr,
+  };
+
+  console.log("Posting:", JSON.stringify(payload, null, 2));
+
+  const res = await fetch(RATES_ENDPOINT, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RATES_API_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`Edge function error ${res.status}: ${text}`);
+  }
+
+  console.log("Success:", text);
+
+  await browser.close();
+}
+
+main().catch((err) => {
+  console.error("FAILED:", err);
+  process.exit(1);
 });
-
-const text = await res.text();
-if (!res.ok) {
-  throw new Error(`POST failed ${res.status}: ${text}`);
-}
-
-console.log("Success:", text);
