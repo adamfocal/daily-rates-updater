@@ -2,12 +2,13 @@ name: Daily Rates Update
 
 on:
   schedule:
-    - cron: "30 12 * * 1-5" # weekdays 12:30 UTC
-  workflow_dispatch:
+    - cron: "15 7 * * *"
+  workflow_dispatch: {}
 
 jobs:
   update:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,12 +19,11 @@ jobs:
           node-version: "20"
 
       - name: Install deps + Chromium
-        run: |
-          npm install
-          npx playwright install --with-deps chromium
+        run: npm ci
 
       - name: Run updater
         env:
+          RATES_SOURCE_URL: ${{ vars.RATES_SOURCE_URL }}
           RATES_ENDPOINT: ${{ secrets.RATES_ENDPOINT }}
           RATES_API_TOKEN: ${{ secrets.RATES_API_TOKEN }}
         run: npm run run
