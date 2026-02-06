@@ -320,6 +320,9 @@ async function main() {
     headers: {
       Authorization: `Bearer ${RATES_API_TOKEN}`,
       "Content-Type": "application/json",
+
+      // Required by Lovable-managed Supabase routing
+      "x-project-ref": "focaldatabase",
     },
     body: JSON.stringify(payload),
   });
