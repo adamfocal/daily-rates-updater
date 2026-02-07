@@ -3,8 +3,8 @@ import { chromium } from "playwright";
 
 /**
  * ENV required in GitHub Actions:
- * - RATES_ENDPOINT      (your Supabase edge function endpoint)
- * - RATES_API_TOKEN     (Bearer token)
+ * - RATES_ENDPOINT      (Supabase edge function endpoint, e.g. https://<project-ref>.supabase.co/functions/v1/update-rates)
+ * - RATES_API_TOKEN     (Supabase anon key OR service_role key)
  * - RATES_SOURCE_URL    (the web page that shows BOTH tables)
  *
  * Optional:
@@ -21,8 +21,6 @@ const debug = !!DEBUG;
 function log(...args) {
   if (debug) console.log(...args);
 }
-
-const DATE_RE = /\b\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\b/g;
 
 function parsePercentToNumber(v) {
   if (v == null) return null;
@@ -187,9 +185,7 @@ async function extractRatesFromTreasuryTable(tableEl) {
     const out = [];
     const trs = Array.from(table.querySelectorAll("tbody tr"));
     for (const tr of trs) {
-      const tds = Array.from(tr.querySelectorAll("td")).map((td) =>
-        (td.textContent || "").trim()
-      );
+      const tds = Array.from(tr.querySelectorAll("td")).map((td) => (td.textContent || "").trim());
       if (tds.length >= 4) {
         out.push({ termLabel: tds[0], col1: tds[1], col2: tds[2], col3: tds[3] });
       }
@@ -233,9 +229,7 @@ async function extractRatesFromSofrTable(tableEl) {
     const out = [];
     const trs = Array.from(table.querySelectorAll("tbody tr"));
     for (const tr of trs) {
-      const tds = Array.from(tr.querySelectorAll("td")).map((td) =>
-        (td.textContent || "").trim()
-      );
+      const tds = Array.from(tr.querySelectorAll("td")).map((td) => (td.textContent || "").trim());
       if (tds.length >= 4) {
         out.push({ termLabel: tds[0], col1: tds[1], col2: tds[2], col3: tds[3] });
       }
@@ -314,15 +308,15 @@ async function main() {
   };
 
   console.log("Posting:", JSON.stringify(payload, null, 2));
+  console.log("Endpoint:", RATES_ENDPOINT);
 
+  // ✅ Key change: use standard Supabase headers (works for external callers like GitHub Actions)
   const res = await fetch(RATES_ENDPOINT, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${RATES_API_TOKEN}`,
+      apikey: RATES_API_TOKEN,
       "Content-Type": "application/json",
-
-      // Required by Lovable-managed Supabase routing
-      "x-project-ref": "focaldatabase",
     },
     body: JSON.stringify(payload),
   });
