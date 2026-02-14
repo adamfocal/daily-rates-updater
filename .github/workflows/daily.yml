@@ -2,7 +2,7 @@ name: Rates Auto Update
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # runs every 6 hours (UTC)
+    - cron: "0 */3 * * *"   # runs every 3 hours (UTC)
   workflow_dispatch:
 
 jobs:
